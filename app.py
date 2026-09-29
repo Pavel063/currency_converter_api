@@ -7,15 +7,16 @@ import requests
 app = Flask(__name__)
 DB = 'converter.db'
 API_BASE = 'https://api.frankfurter.dev/v2'
-# Frankfurter can use a blended feed or a pinned provider. We use ECB here
-# so the displayed rate comes from an official reference-rate provider.
+# Frankfurter supports both pinned official providers and an aggregated feed.
+# ECB is the default for standard currencies; RUB and KZT use their national sources.
 API_PROVIDER = 'ecb'
 
 # Fallback list used only to build the selectors if the API is temporarily unavailable.
 CURRENCIES = {
     'EUR': 'Евро', 'USD': 'Доллар США', 'GBP': 'Фунт стерлингов',
-    'RUB': 'Российский рубль', 'CNY': 'Китайский юань',
-    'JPY': 'Японская иена', 'CHF': 'Швейцарский франк', 'PLN': 'Польский злотый'
+    'RUB': 'Российский рубль', 'KZT': 'Казахстанский тенге',
+    'CNY': 'Китайский юань', 'JPY': 'Японская иена',
+    'CHF': 'Швейцарский франк', 'PLN': 'Польский злотый'
 }
 
 
@@ -48,16 +49,51 @@ def init_db():
 
 
 def fetch_rate(src: str, dst: str):
-    """Return (rate, date) from Frankfurter/ECB."""
+    """Return (rate, date, provider) using the most relevant official source.
+
+    ECB is used for the standard currencies. RUB is requested from the
+    Central Bank of Russia (CBR), and KZT from the National Bank of Kazakhstan
+    (NBK). If a provider-specific pair is unavailable, the general Frankfurter
+    endpoint is used as a fallback.
+    """
     if src == dst:
         today = datetime.now(timezone.utc).date().isoformat()
-        return Decimal('1'), today
+        return Decimal('1'), today, 'Без запроса к API (одинаковые валюты)'
 
-    url = f'{API_BASE}/providers/{API_PROVIDER}/rate/{src.lower()}/{dst.lower()}'
-    response = requests.get(url, timeout=8)
-    response.raise_for_status()
-    data = response.json()
-    return Decimal(str(data['rate'])), data['date']
+    # Use the provider associated with the special currency in the pair.
+    # When RUB and KZT are both selected, use the aggregated official feed
+    # because neither single-country provider is guaranteed to publish every
+    # RUB/KZT cross-rate.
+    provider = API_PROVIDER
+    provider_label = 'European Central Bank (ECB) через Frankfurter'
+    if src == 'RUB' and dst != 'KZT' or dst == 'RUB' and src != 'KZT':
+        provider = 'cbr'
+        provider_label = 'Центральный банк России (CBR) через Frankfurter'
+    elif src == 'KZT' and dst != 'RUB' or dst == 'KZT' and src != 'RUB':
+        provider = 'nbk'
+        provider_label = 'Национальный банк Казахстана (NBK) через Frankfurter'
+
+    if src == 'RUB' and dst == 'KZT' or src == 'KZT' and dst == 'RUB':
+        provider = None
+        provider_label = 'Frankfurter — агрегированные официальные источники'
+
+    if provider:
+        url = f'{API_BASE}/providers/{provider}/rate/{src.lower()}/{dst.lower()}'
+    else:
+        url = f'{API_BASE}/rate/{src.lower()}/{dst.lower()}'
+
+    try:
+        response = requests.get(url, timeout=8)
+        response.raise_for_status()
+        data = response.json()
+        return Decimal(str(data['rate'])), data['date'], provider_label
+    except (requests.RequestException, KeyError, ValueError, InvalidOperation):
+        # Fallback to Frankfurter's aggregated official-source feed.
+        fallback = f'{API_BASE}/rate/{src.lower()}/{dst.lower()}'
+        response = requests.get(fallback, timeout=8)
+        response.raise_for_status()
+        data = response.json()
+        return Decimal(str(data['rate'])), data['date'], 'Frankfurter — агрегированные официальные источники'
 
 
 @app.route('/')
@@ -83,7 +119,7 @@ def convert():
         return jsonify({'error': 'Сумма вне допустимого диапазона'}), 400
 
     try:
-        rate, rate_date = fetch_rate(src, dst)
+        rate, rate_date, provider = fetch_rate(src, dst)
     except (requests.RequestException, KeyError, ValueError, InvalidOperation) as exc:
         app.logger.warning('Currency API error: %s', exc)
         return jsonify({'error': 'Не удалось получить актуальный курс. Проверьте подключение к интернету.'}), 502
@@ -103,7 +139,7 @@ def convert():
         'result': float(result.quantize(Decimal('0.01'))),
         'rate': float(rate),
         'rate_date': rate_date,
-        'provider': 'European Central Bank (через Frankfurter)',
+        'provider': provider,
         'src': src,
         'dst': dst
     })
@@ -141,10 +177,10 @@ def vulnerable_history(user_id):
 
 @app.route('/api/rates')
 def rates():
-    """Return live EUR rates from ECB through Frankfurter."""
+    """Return live EUR rates from Frankfurter using official-source data."""
     try:
         response = requests.get(
-            f'{API_BASE}/providers/{API_PROVIDER}/rates',
+            f'{API_BASE}/rates',
             params={'base': 'EUR', 'quotes': ','.join(CURRENCIES.keys())},
             timeout=8,
         )
